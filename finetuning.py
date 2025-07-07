@@ -9,15 +9,20 @@ import cv2
 import numpy as np
 from pathlib import Path
 import warnings
+import pandas as pd
+from torch.utils.data import random_split
 warnings.filterwarnings("ignore")
 
 # === Configuración adaptativa (CUDA/CPU) ===
-BASE_DIR = "./training"
+TRAIN_DIR = "./training"
+VALIDATION_DIR = "./validacion"
 CLIP_DURATION = 2.56  # segundos
 STRIDE = 1.0  # segundos
 EPOCHS = 10
 LEARNING_RATE = 1e-4
+EARLY_STOPPING_PATIENCE = 3
 OUTPUT_MODEL = "i3d_finetuned_violencia_robo_normal.pth"
+METRICS_FILE = "training_metrics.xlsx"
 PRETRAINED_MODEL = "I3D_8x8_R50_pytorchvideo.pyth"  # Formato PyTorchVideo
 LABELS = ["Normal", "Robo", "Violencia"]
 TARGET_SIZE = (224, 224)
@@ -359,32 +364,35 @@ def modificar_capa_final(model, num_clases):
     return False
 
 # === Entrenamiento adaptativo (CUDA/CPU) ===
-def entrenar_modelo(model, dataloader, device, num_epochs, config):
-    """Función principal de entrenamiento adaptativa para CUDA/CPU"""
+def entrenar_modelo(model, train_loader, val_loader, device, num_epochs, config):
+    """Función principal de entrenamiento con validación y early stopping"""
     model.to(device)
-    model.train()
     
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
     
-    # Configurar mixed precision si está disponible
     scaler = None
     if config['use_mixed_precision'] and device.type == 'cuda':
         from torch.cuda.amp import GradScaler, autocast
         scaler = GradScaler()
         print("✅ Mixed Precision habilitado (AMP)")
-    
-    # Optimizaciones CUDA
+
     if device.type == 'cuda':
-        torch.backends.cudnn.benchmark = True  # Optimizar para tamaños fijos
-        torch.backends.cudnn.deterministic = False  # Mejor rendimiento
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
         print(f"🚀 Optimizaciones CUDA habilitadas")
         print(f"📊 VRAM disponible: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    
+
     print(f"\n🚀 [Entrenamiento iniciado en {device}]")
     print(f"📋 Configuración: {num_epochs} épocas, batch_size={config['batch_size']}, lr={LEARNING_RATE}")
-    
+
+    history = []
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_model_state = None
+
     for epoch in range(num_epochs):
+        model.train()  # Modo entrenamiento
         running_loss = 0.0
         correct_predictions = 0
         total_samples = 0
@@ -392,81 +400,134 @@ def entrenar_modelo(model, dataloader, device, num_epochs, config):
         
         print(f"\n📅 --- Época {epoch+1}/{num_epochs} ---")
         
-        for batch_idx, batch in enumerate(dataloader):
+        for batch_idx, batch in enumerate(train_loader):
             batch_start_time = time.time()
-            
-            # Mover datos al device (optimizado)
             videos = batch['video'].to(device, non_blocking=config['pin_memory'])
             labels = batch['label'].to(device, non_blocking=config['pin_memory'])
             
             optimizer.zero_grad()
             
-            # Forward pass con mixed precision si está disponible
             if scaler is not None:
                 with autocast():
                     outputs = model(videos)
                     loss = criterion(outputs, labels)
-                
-                # Backward pass con scaling
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                # Forward pass normal
                 outputs = model(videos)
                 loss = criterion(outputs, labels)
-                
-                # Backward pass normal
                 loss.backward()
                 optimizer.step()
             
-            # Estadísticas
             running_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
             total_samples += labels.size(0)
             correct_predictions += (predicted == labels).sum().item()
             
-            # Calcular ETA
             batch_time = time.time() - batch_start_time
-            remaining_batches = len(dataloader) - batch_idx - 1
+            remaining_batches = len(train_loader) - batch_idx - 1
             eta_seconds = batch_time * remaining_batches
-            
-            # Log del lote con info de GPU
             accuracy = 100 * correct_predictions / total_samples
             gpu_memory = torch.cuda.memory_allocated(0) / 1e9 if device.type == 'cuda' else 0
-            
+
+            log_msg = (
+                f"   [{batch_idx+1:4d}/{len(train_loader):4d}] "
+                f"Loss: {loss.item():.4f} | "
+                f"Acc: {accuracy:.2f}% | "
+                f"ETA: {int(eta_seconds):3d}s"
+            )
             if device.type == 'cuda':
-                print(f"   [{batch_idx+1:4d}/{len(dataloader):4d}] "
-                      f"Loss: {loss.item():.4f} | "
-                      f"Acc: {accuracy:.2f}% | "
-                      f"GPU: {gpu_memory:.1f}GB | "
-                      f"ETA: {int(eta_seconds):3d}s")
-            else:
-                print(f"   [{batch_idx+1:4d}/{len(dataloader):4d}] "
-                      f"Loss: {loss.item():.4f} | "
-                      f"Acc: {accuracy:.2f}% | "
-                      f"ETA: {int(eta_seconds):3d}s")
-            
-            # Liberar memoria cache cada cierto número de batches
+                log_msg += f" | GPU: {gpu_memory:.1f}GB"
+            print(log_msg)
+
             if batch_idx % 50 == 0 and device.type == 'cuda':
                 torch.cuda.empty_cache()
         
-        # Resumen de la época
         epoch_time = time.time() - epoch_start_time
-        avg_loss = running_loss / len(dataloader)
-        epoch_accuracy = 100 * correct_predictions / total_samples
+        avg_train_loss = running_loss / len(train_loader)
+        train_accuracy = 100 * correct_predictions / total_samples
+        
+        # Validación
+        val_loss, val_accuracy = validar_modelo(model, val_loader, device, criterion)
         
         print(f"   ✅ Época {epoch+1} completada en {int(epoch_time)}s")
-        print(f"      Loss promedio: {avg_loss:.4f}")
-        print(f"      Accuracy final: {epoch_accuracy:.2f}%")
-        
+        print(f"      Train Loss: {avg_train_loss:.4f}, Train Acc: {train_accuracy:.2f}%")
+        print(f"      Valid Loss: {val_loss:.4f}, Valid Acc: {val_accuracy:.2f}%")
+
+        history.append({
+            'epoch': epoch + 1,
+            'train_loss': avg_train_loss,
+            'train_accuracy': train_accuracy,
+            'val_loss': val_loss,
+            'val_accuracy': val_accuracy
+        })
+
+        # Early Stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_state = model.state_dict()
+            print(f"   ⭐ Nuevo mejor modelo guardado (Val Loss: {best_val_loss:.4f})")
+        else:
+            epochs_no_improve += 1
+            print(f"   📉 Sin mejora por {epochs_no_improve} épocas")
+
+        if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
+            print(f"\n🛑 Early stopping en la época {epoch+1}")
+            break
+
         if device.type == 'cuda':
             print(f"      VRAM máxima usada: {torch.cuda.max_memory_allocated(0) / 1e9:.1f} GB")
             torch.cuda.reset_peak_memory_stats()
+
+    # Cargar el mejor modelo y guardarlo
+    if best_model_state:
+        model.load_state_dict(best_model_state)
     
-    # Guardar modelo
     torch.save(model.state_dict(), OUTPUT_MODEL)
-    print(f"\n💾 Modelo guardado como '{OUTPUT_MODEL}'")
+    print(f"\n💾 Mejor modelo guardado como '{OUTPUT_MODEL}'")
+
+    # Exportar métricas
+    exportar_metricas_excel(history, METRICS_FILE)
+    df_metrics = pd.DataFrame(history)
+    df_metrics.to_excel(METRICS_FILE, index=False)
+    print(f"📊 Métricas de entrenamiento guardadas en '{METRICS_FILE}'")
+
+# === Validación y Early Stopping ===
+def validar_modelo(model, dataloader, device, criterion):
+    """Evalúa el modelo en el conjunto de validación"""
+    model.eval()  # Modo evaluación
+    running_loss = 0.0
+    correct_predictions = 0
+    total_samples = 0
+    
+    with torch.no_grad():  # No calcular gradientes
+        for batch in dataloader:
+            videos = batch['video'].to(device)
+            labels = batch['label'].to(device)
+            
+            outputs = model(videos)
+            loss = criterion(outputs, labels)
+            
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total_samples += labels.size(0)
+            correct_predictions += (predicted == labels).sum().item()
+            
+    avg_loss = running_loss / len(dataloader)
+    accuracy = 100 * correct_predictions / total_samples
+    
+    return avg_loss, accuracy
+
+def exportar_metricas_excel(history, filepath):
+    """Exporta el historial de métricas a un archivo Excel"""
+    try:
+        df = pd.DataFrame(history)
+        df.to_excel(filepath, index=False)
+        print(f"\n📊 Métricas exportadas exitosamente a '{filepath}'")
+    except Exception as e:
+        print(f"\n⚠️ Error exportando métricas a Excel: {e}")
 
 # === MAIN adaptativo (CUDA/CPU) ===
 def main():
@@ -493,32 +554,41 @@ def main():
         print(f"🖥️  Device: {device}")
         print(f"💡 Para usar GPU, ejecuta: setup_cuda.bat")
     
-    # Recolectar videos
-    print(f"\n📂 Buscando videos en: {BASE_DIR}")
-    video_paths = recolectar_videos(BASE_DIR)
-    
-    if not video_paths:
-        print("❌ No se encontraron videos. Verifica la estructura de carpetas.")
+    # Recolectar videos de entrenamiento y validación
+    print(f"\n📂 Buscando videos de ENTRENAMIENTO en: {TRAIN_DIR}")
+    train_video_paths = recolectar_videos(TRAIN_DIR)
+    if not train_video_paths:
+        print("❌ No se encontraron videos de entrenamiento. Verifica la estructura de carpetas.")
         return
-    
-    print(f"✅ Total de videos encontrados: {len(video_paths)}")
-    
-    # Mostrar estadísticas
-    contar_videos_por_etiqueta(video_paths)
-    estimar_clips_totales(video_paths)
-    
-    # Crear dataset con sliding window
-    print("🔄 Creando dataset con sliding window...")
-    dataset = SlidingWindowVideoDataset(
-        video_paths=video_paths,
+    print(f"✅ Total de videos de entrenamiento: {len(train_video_paths)}")
+    contar_videos_por_etiqueta(train_video_paths)
+
+    print(f"\n📂 Buscando videos de VALIDACIÓN en: {VALIDATION_DIR}")
+    val_video_paths = recolectar_videos(VALIDATION_DIR)
+    if not val_video_paths:
+        print("❌ No se encontraron videos de validación. Verifica la estructura de carpetas.")
+        return
+    print(f"✅ Total de videos de validación: {len(val_video_paths)}")
+    contar_videos_por_etiqueta(val_video_paths)
+
+    # Crear datasets para entrenamiento y validación
+    print("\n🔄 Creando datasets con sliding window...")
+    train_dataset = SlidingWindowVideoDataset(
+        video_paths=train_video_paths,
         clip_duration=CLIP_DURATION,
         stride=STRIDE,
         num_frames=NUM_FRAMES
     )
-    
-    # Crear dataloader con configuración adaptativa
-    dataloader = DataLoader(
-        dataset,
+    val_dataset = SlidingWindowVideoDataset(
+        video_paths=val_video_paths,
+        clip_duration=CLIP_DURATION,
+        stride=STRIDE,
+        num_frames=NUM_FRAMES
+    )
+
+    # Crear dataloaders para entrenamiento y validación
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=config['batch_size'],
         shuffle=True,
         num_workers=config['num_workers'],
@@ -526,9 +596,16 @@ def main():
         persistent_workers=config['num_workers'] > 0
     )
     
-    print(f"✅ DataLoader creado: {len(dataset)} clips, {len(dataloader)} batches")
-    if device.type == 'cuda':
-        print(f"🔧 Optimizaciones: pin_memory={config['pin_memory']}, num_workers={config['num_workers']}")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers'],
+        pin_memory=config['pin_memory'],
+        persistent_workers=config['num_workers'] > 0
+    )
+    
+    print(f"✅ DataLoaders creados: {len(train_loader)} batches de entrenamiento, {len(val_loader)} batches de validación")
     
     # Crear modelo
     print("\n🧠 Configurando modelo I3D...")
@@ -549,7 +626,7 @@ def main():
     print(f"📊 Parámetros del modelo: {model_params:,}")
     
     # Entrenar
-    entrenar_modelo(model, dataloader, device, EPOCHS, config)
+    entrenar_modelo(model, train_loader, val_loader, device, EPOCHS, config)
     
     print("\n🎉 ¡Entrenamiento completado!")
     if device.type == 'cuda':
