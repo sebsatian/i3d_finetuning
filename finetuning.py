@@ -175,7 +175,7 @@ class SlidingWindowVideoDataset(Dataset):
 
 # === Funciones de utilidad ===
 def recolectar_videos(base_dir):
-    """Recolecta todas las rutas de videos con sus etiquetas"""
+    """Recolecta todas las rutas de videos con sus etiquetas de forma recursiva"""
     video_paths = []
     label_to_idx = {label: idx for idx, label in enumerate(LABELS)}
     
@@ -185,7 +185,8 @@ def recolectar_videos(base_dir):
             print(f"⚠️ Directorio no encontrado: {label_dir}")
             continue
         
-        for video_file in label_dir.glob("*.mp4"):
+        # Búsqueda recursiva de videos .mp4
+        for video_file in label_dir.glob("**/*.mp4"):
             video_paths.append((str(video_file), label_to_idx[label]))
     
     return video_paths
